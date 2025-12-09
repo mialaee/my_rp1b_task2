@@ -1,0 +1,333 @@
+# ========================== Variant calling validation & SNP/Indel Pipeline ============================== #
+
+This repository implements Task2, which involves developing:
+1. A simulated validation workflow
+2. A full variant-calling pipeline using minimap2, bcftools and snippy
+3. Evaluation of precision/recall on simulated data
+4. Application of the pipeline to real E.coli Illumina sequencing data
+
+All scripts are inside the scripts/ directory.
+
+# Summary of Scripts:
+
+mutate_genome.py > Create mutated genome + truth VCF (controlled SNPs/indels)
+simulated_reads.py > Generate synthetic Illumina reads (30x)
+run_pipeline.sh > Full variant-calling pipeline (mapping -> callers -> merge)
+evaluate_vcf.py > Compute TP/FP/FN, precision, recall
+
+============================ Environment Setup =========================
+
+While building the pipeline, snippy failed with:
+Need samtools --version >= 1.7 but you have 1.22
+
+Snippy requires older-style samtools version formatting, so a dedicated conda environment is needed.
+
+# COMMAND TO RUN 
+conda create -n task2env \
+  python=3.10 \
+  minimap2 \
+  samtools=1.9 \
+  bcftools \
+  snippy \
+  freebayes \
+
+This solved snippy's version check problem.
+
+# COMMAND TO ACTIVATE ENVIRONMENT
+conda activate task2env
+
+# COMMAND TO CREATE PROJECT DIRECTORIES FOR RESULTS
+mkdir results
+mkdir results/part1
+mkdir results/part2
+  
+
+======================== Part 1 - Validation Code ======================
+
+1. Overview
+
+Part 1 generates ground-truth datasets for evaluating variant callers.
+
+The workflow:
+1.) Mutate a genome with known SNPs + indels
+2.) Simualte 30x depth of perfect 100bp Illumina reads
+3.) Map reads back to the original (unmutated) reference
+4.) Call variants using bcftools
+5.) Compare detected variants with the truth set (precision/recall)
+
+
+2. Mutation generation 
+
+The script mutate_genome.py :
+- Reads a reference FASTA.
+- Introduces
+  > 300 SNPs
+  > 20 indels of 1-10bp
+  
+- Outputs:
+  > *.mut.fasta -> mutated genome
+  > *.truth.vcf -> ground-truth mutations
+  
+# Commands used 
+
+python3 scripts/mutate_genome.py data/NC_037282.1.fasta results/part1/NC_037282 --snps 300 --indels 20
+
+python3 scripts/mutate_genome.py data/EcoliK12-MG1655.fasta results/part1/EcoliK12 --snps 300 --indels 20
+
+Outputs
+> results/part1/NC_037282.mut.fasta
+> results/part1/NC_037282.truth.vcf
+> results/part1/EcoliK12.mut.fasta
+> results/part1/EcoliK12.truth.vcf
+
+
+3. Simulating reads
+
+The script simulate_reads.py generates perfect single-end 100bp FASTQ Illumina reads at 30x depth.
+
+# Commands used
+
+python3 scripts/simulate_reads.py results/part1/EcoliK12.mut.fasta results/part1/EcoliK12_30x_100bp.fq
+
+python3 scripts/simulate_reads.py results/part1/NC_037282.mut.fasta results/part1/NC_037282_30x_100bp.fq
+
+Outputs
+> This creates a single-end FASTQ file.
+> *.fq 
+
+
+4. Mapping simulated reads
+
+Reads were mapped back to the unmutated original reference using minimap2 + samtools.
+
+# Commands used for index reference once per genome
+minimap2 -d data/EcoliK12-MG1655.mmi data/EcoliK12-MG1655.fasta
+minimap2 -d data/NC_037282.1.mmi data/NC_037282.1.fasta
+
+# Commands used for map and sort BAM
+
+ minimap2 -a -x sr data/EcoliK12-MG1655.fasta results/part1/EcoliK12_30x_100bp.fq \
+  | samtools view -h -F 0x900 - \
+  | samtools sort -O bam -o results/part1/EcoliK12.sorted.bam
+samtools index results/part1/EcoliK12.sorted.bam
+
+minimap2 -a -x sr data/NC_037282.1.fasta results/part1/NC_037282_30x_100bp.fq \
+  | samtools view -h -F 0x900 - \
+  | samtools sort -O bam -o results/part1/NC_037282.sorted.bam
+samtools index results/part1/NC_037282.sorted.bam
+ 
+ 
+5. Variant calling bcftools
+
+# Commands used
+bcftools mpileup -Ou -f data/EcoliK12-MG1655.fasta results/part1/EcoliK12.sorted.bam \
+  | bcftools call -mv -Oz -o results/part1/EcoliK12.bcftools.vcf.gz
+bcftools index results/part1/EcoliK12.bcftools.vcf.gz
+
+
+bcftools mpileup -Ou -f data/NC_037282.1.fasta results/part1/NC_037282.sorted.bam \
+  | bcftools call -mv -Oz -o results/part1/NC_037282.bcftools.vcf.gz
+bcftools index results/part1/NC_037282.bcftools.vcf.gz
+
+
+
+6. Evaluating variants calls (evaluate_vcf.py)
+
+The script computes:
+> TP: variants correctly detected
+> FP: variants called but not real
+> FN: variants missed
+> Precision = TP / (TP + FP)
+> Recall = TP / (TP + FN)
+
+# Commands used
+python3 scripts/evaluate_vcf.py \
+  results/part1/EcoliK12.truth.vcf \
+  results/part1/EcoliK12.bcftools.vcf.gz
+  
+python3 scripts/evaluate_vcf.py \
+  results/part1/NC_037282.truth.vcf \
+  results/part1/NC_037282.bcftools.vcf.gz
+  
+  
+- Results summary
+
+Genome                 TP     FP     FN     Precision    Recall
+
+E.coli MG1655         303     11     17       0.965       0.947
+
+NC_037282 plasmid     307     13     13       0.959       0.959
+
+
+- Interpretation
+> bcftools performs very well under ideal conditions
+> Precision ~ 96-97% 
+> Recall ~ 94-96%
+> Most errors stem from indels, which are harder to call.
+
+
+
+============================ Part 2 - Variant calling pipeline ===================================
+
+All steps are implemented in:
+scripts/run_pipeline.sh
+
+The pipeline performs:
+1.) Mapping with minimap2
+2.) Variant calling with bcftools
+3.) Variant calling with snippy
+4.) Normalisation and tagging
+5.) Union of callers into one combined VCF
+
+1. Running the pipeline on simulated reads
+
+# COMMAND TO RUN
+bash scripts/run_pipeline.sh \
+  data/EcoliK12-MG1655.fasta \
+  results/part1/EcoliK12_30x_100bp.fq \
+  - \
+  results/part2/EcoliK12_sim
+  
+Outputs include:
+results/part2/EcoliK12_sim.sorted.bam
+results/part2/EcoliK12_sim_snippy/snps.vcf
+results/part2/EcoliK12_sim.bcftools.tagged.vcf.gz
+results/part2/EcoliK12_sim.snippy.tagged.vcf.gz
+results/part2/EcoliK12_sim.combined.vcf.gz
+
+
+2. Evaluating the pipeline on simulated data
+
+# COMMAND TO RUN
+python3 scripts/evaluate_vcf.py \
+  results/part1/EcoliK12.truth.vcf \
+  results/part2/EcoliK12_sim.combined.vcf.gz
+
+Interpretation 
+> Precision very high (~0.99) -> very few false positives
+> Recall high (~98) -> almost all true varaints recovered
+> Combined VCF improved recall
+- bcftools missed some variants that snippy caughts
+- snippy missed some variants that bcftools caught
+- combining them reduced FN at the cost of a few more FP (expected)
+
+
+3. Run pipeline on real Illumina data
+
+Data used next:
+data/fastq-to-use-at-the-end/SRR25083113_1.fastq.gz
+data/fastq-to-use-at-the-end/SRR25083113_2.fastq.gz
+
+# Run this command
+bash scripts/run_pipeline.sh \
+  data/EcoliK12-MG1655.fasta \
+  data/fastq-to-use-at-the-end/SRR25083113_1.fastq.gz \
+  data/fastq-to-use-at-the-end/SRR25083113_2.fastq.gz \
+  results/part2/EcoliK12_real
+
+Outputs:
+results/part2/EcoliK12_real.sorted.bam
+results/part2/EcoliK12_real_snippy/snps.vcf
+results/part2/EcoliK12_real.bcftools.tagged.vcf.gz
+results/part2/EcoliK12_real.snippy.tagged.vcf.gz
+results/part2/EcoliK12_real.combined.vcf.gz
+
+# Run Inspecting Command:
+bcftools view results/part2/EcoliK12_real.combined.vcf.gz | head
+
+# Run Variant Count Command:
+bcftools view results/part2/EcoliK12_real.combined.vcf.gz | grep -v '^#' | wc -l
+
+Output:
+125753 variants
+
+# Run View Alignments Command:
+samtools tview results/part2/EcoliK12_real.sorted.bam data/EcoliK12-MG1655.fasta
+
+# Run Command To View Table Of Variants:
+bcftools view results/part2/EcoliK12_sim.combined.vcf.gz
+
+============================ Part 3 - Evaluation & Discussion ========================
+
+
+# Simulated Data (Ground-truth available)
+
+The simulated dataset provides a controlled environemnt where the true mutations (300 SNPs and 20 indels) are known. This enables quantitative evaluation of variant calling accuracy.
+
+# Caller performance
+
+Analysis of the bcftools, snippy and combined VCF outputs shows:
+
+- Both callers successfully recove the majority of true SNPs and indels.
+> Each tool achieves high precision and high recll, reflecting strong performance under clean, noise-free sequencing conditions.
+
+- bcftools exhibits slightly higher recall. 
+> bcftools identifies more true variants overall, particularly SNPs, meaning it misses fewer true positions (lower FN count).
+
+- snippy produces fewer false positives.
+> snippy applies stricter filtering internally, which lowers FP but can slightly increase FN.
+> This results in higher precision but slightly reduced recall compared to bcftools.
+
+- The combined VCF gives the best overall performance.
+> Merging bcftools and snippy calls increases sensitivity:
+    - bcftools recovers variants snippy misses
+    - snippy recovers variants bcftools misses
+    - the overlap region (variants called by both) is extremely reliable
+
+From the evaluation script:
+> Precision ≈ 0.978
+> Recall ≈ 0.959
+
+This confirms that combining callers reduces false negatives while only slightly ihncreasing false positives - desirable when the priority is sensitivity. 
+
+
+# Real Data (No ground-truth available)
+
+Unlike the simulated dataset, the real *E.coli* Illumina dataset does not come with a known truth set. Therefore:
+> Precision and recall cannot be calculated for real data.
+
+Instead, the evaluation focuses on qualitative assessment and comparison between the two callers.
+
+
+# Variant Discovery
+
+The combined VCF contains:
+> 125,753 called variants
+
+This is typical for a real bacterial isolate to the MG1655 reference genome, reflecting true biological divergence plus technical noise.
+
+
+# Consistency between callers
+
+Patterns observed:
+- Variants called by both bcftools and snippy appear highly reliable.
+> These sites show strong read support, good depth, and consistent allele frequency.
+
+- Caller-specific variants tend to cluster in problematic regions, typically caused by:
+> Low mapping quality (poorly aligned reads in repetitive regions)
+> Low read depth (insufficient evidence for variant calling)
+> Repetitive or mobile-element-rich regions (leading to ambiguous alignments)
+> Soft-clipped or multi-mapping reads
+
+
+# Manual Validation
+
+Using: samtools tview results/part2/EcoliK12_real.sorted.bam data/EcoliK12-MG1655.fasta
+
+positions where:
+- both callers agree -> clean, well-supported variants
+- only one caller calls a variant -> often show inconsistent coverage or mixed bases
+- the combined VCF increases sensitivity but may include borderline sites requiring manual inspection.
+
+
+# Interpretation
+
+Real sequencing data introduces biological and technical complexity absent from simulated reads. Without a ground-truth genome, evaluation relies on:
+> caller concordance
+> read-alignment characteristics
+> depth and mapping quality
+> visual inspection using samtools
+
+Despite this, the pipeline behaves as expected:
+- shared variants are trustworthy
+- unique variants require caution 

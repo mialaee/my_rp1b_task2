@@ -1,5 +1,7 @@
 # ========================== Variant calling validation & SNP/Indel Pipeline ============================== #
 
+https://jhub.climb.ac.uk/hub/user-redirect/lab/tree/task2
+
 This repository implements Task2, which involves developing:
 1. A simulated validation workflow
 2. A full variant-calling pipeline using minimap2, bcftools and snippy
